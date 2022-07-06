@@ -1,0 +1,7 @@
+target
+Cargo.lock
+*.wat
+*.wasm
+!testing/integration/tests/assets/*
+.idea/
+lcov.info
