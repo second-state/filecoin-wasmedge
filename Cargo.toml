@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "fvm",
+    "sdk",
+    "shared",
+    "testing/conformance",
+    "testing/integration",
+    "ipld/*",
+    "testing/integration/tests/*"
+]
+
+[profile.actor]
+inherits = "release"
+panic = "abort"
+overflow-checks = true
+lto = true
+opt-level = "z"
+#strip = true
