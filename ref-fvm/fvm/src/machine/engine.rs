@@ -16,6 +16,10 @@ use crate::machine::NetworkConfig;
 use crate::syscalls::{bind_syscalls, InvocationData};
 use crate::Kernel;
 
+use fvm_sdk as sdk;
+use wasmedge_sys::{ Loader, Config, Vm, WasmValue, Store, ImportModule, ImportObject, FuncType, Function};
+use wasmedge_sys::ImportInstance;
+
 /// A caching wasmtime engine.
 #[derive(Clone)]
 pub struct Engine(Arc<EngineInner>);
@@ -231,6 +235,33 @@ impl Engine {
             })?;
             let module = self.load_raw(wasm.as_slice())?;
             cache.insert(*cid, module);
+
+            let host_layer1 = |_: Vec<WasmValue>| -> Result<Vec<WasmValue>, u8> {
+                println!("There is layer1!");
+                Ok(vec![WasmValue::from_i32(1)])
+            };
+
+            let mut vm = Vm::create(None, None)?;
+            vm.load_wasm_from_bytes(&wasm.as_slice())?;
+            vm.validate()?;
+
+            // Wasmedge add host function example
+            let func_ty = FuncType::create(vec![wasmedge_types::ValType::I32;3], vec![wasmedge_types::ValType::I32])?;
+            let host_func = Function::create(&func_ty, Box::new(host_layer1), 0)?;
+            let mut import = ImportModule::create("vm")?;
+            import.add_func("abort", host_func);
+            vm.register_wasm_from_import(ImportObject::Import(import))?;
+            vm.instantiate()?;
+            let result = vm.run_function("invoke", [WasmValue::from_i32(4)])?;
+            println!("result = {:?}", result);
+            // // Wasmedge example with no host function only (no fvm.sdk)
+            // println!("wasmedge demo");
+            // let loader = Loader::create(None).unwrap();
+            // let wasmedge_module = loader.from_bytes(&wasm.as_slice()).unwrap();
+            // let config = Config::create().unwrap();
+            // let mut store = Store::create().expect("fail to create a Store context");
+            // let mut vm = Vm::create(Some(config), Some(&mut store)).expect("fail to create a Vm context");
+            // let result = vm.run_wasm_from_module(wasmedge_module, "invoke", [WasmValue::from_i32(4)]).expect("fail to run the target function in the module");
         }
         Ok(())
     }
