@@ -8,6 +8,10 @@ use cid::Cid;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_wasm_instrument::gas_metering::GAS_COUNTER_NAME;
 use fvm_wasm_instrument::parity_wasm::elements;
+use wasmedge_sys::{
+    Config, Executor, ImportInstance, ImportModule, ImportObject, Loader, Module as EdgeModule,
+    Store, Validator, WasmValue,
+};
 use wasmtime::OptLevel::Speed;
 use wasmtime::{Global, GlobalType, Linker, Memory, MemoryType, Module, Mutability, Val, ValType};
 
@@ -159,6 +163,7 @@ struct EngineInner {
 
     module_cache: Mutex<HashMap<Cid, Module>>,
     instance_cache: Mutex<anymap::Map<dyn anymap::any::Any + Send>>,
+    edge_module_cache: Mutex<HashMap<Cid, EdgeModule>>,
     config: EngineConfig,
 
     actor_redirect: HashMap<Cid, Cid>,
@@ -180,7 +185,6 @@ impl Engine {
     /// Create a new Engine from a wasmtime config.
     pub fn new(c: &wasmtime::Config, ec: EngineConfig) -> anyhow::Result<Self> {
         let engine = wasmtime::Engine::new(c)?;
-
         let mut dummy_store = wasmtime::Store::new(&engine, ());
         let gg_type = GlobalType::new(ValType::I64, Mutability::Var);
         let dummy_gg = Global::new(&mut dummy_store, gg_type, Val::I64(0))
@@ -197,6 +201,7 @@ impl Engine {
             dummy_gas_global: dummy_gg,
             module_cache: Default::default(),
             instance_cache: Mutex::new(anymap::Map::new()),
+            edge_module_cache: Default::default(),
             config: ec,
             actor_redirect,
         })))
@@ -218,9 +223,14 @@ impl Engine {
         I: IntoIterator<Item = &'a Cid>,
     {
         let mut cache = self.0.module_cache.lock().expect("module_cache poisoned");
+        let mut edge_cache = self
+            .0
+            .edge_module_cache
+            .lock()
+            .expect("edge_module_cache poisoned");
         for cid in cids {
             let cid = self.with_redirect(cid);
-            if cache.contains_key(cid) {
+            if cache.contains_key(cid) && edge_cache.contains_key(cid) {
                 continue;
             }
             let wasm = blockstore.get(cid)?.ok_or_else(|| {
@@ -229,8 +239,9 @@ impl Engine {
                     &cid.to_string()
                 )
             })?;
-            let module = self.load_raw(wasm.as_slice())?;
+            let (module, edge_module) = self.load_raw(wasm.as_slice())?;
             cache.insert(*cid, module);
+            edge_cache.insert(*cid, edge_module);
         }
         Ok(())
     }
@@ -243,21 +254,34 @@ impl Engine {
     }
 
     /// Load some wasm code into the engine.
-    pub fn load_bytecode(&self, k: &Cid, wasm: &[u8]) -> anyhow::Result<Module> {
+    pub fn load_bytecode(&self, k: &Cid, wasm: &[u8]) -> anyhow::Result<(Module, EdgeModule)> {
         let k = self.with_redirect(k);
         let mut cache = self.0.module_cache.lock().expect("module_cache poisoned");
+        let mut edge_cache = self
+            .0
+            .edge_module_cache
+            .lock()
+            .expect("edge_module_cache poisoned");
         let module = match cache.get(k) {
             Some(module) => module.clone(),
             None => {
-                let module = self.load_raw(wasm)?;
+                let (module, _) = self.load_raw(wasm)?;
                 cache.insert(*k, module.clone());
                 module
             }
         };
-        Ok(module)
+        let edge_module = match edge_cache.get(k) {
+            Some(module) => module.clone(),
+            None => {
+                let (_, edge_module) = self.load_raw(wasm)?;
+                edge_cache.insert(*k, edge_module.clone());
+                edge_module
+            }
+        };
+        Ok((module, edge_module))
     }
 
-    fn load_raw(&self, raw_wasm: &[u8]) -> anyhow::Result<Module> {
+    fn load_raw(&self, raw_wasm: &[u8]) -> anyhow::Result<(Module, EdgeModule)> {
         // First make sure that non-instrumented wasm is valid
         Module::validate(&self.0.engine, raw_wasm)
             .map_err(anyhow::Error::msg)
@@ -294,8 +318,13 @@ impl Engine {
 
         let wasm = m.to_bytes()?;
         let module = Module::from_binary(&self.0.engine, wasm.as_slice())?;
-
-        Ok(module)
+        let loader = Loader::create(None)?;
+        let edge_module = loader.from_bytes(wasm.as_slice())?;
+        // validate module
+        let config = Config::create()?;
+        let validator = Validator::create(Some(config))?;
+        validator.validate(&edge_module)?;
+        Ok((module, edge_module))
     }
 
     /// Load compiled wasm code into the engine.
@@ -318,14 +347,23 @@ impl Engine {
     }
 
     /// Lookup a loaded wasmtime module.
-    pub fn get_module(&self, k: &Cid) -> Option<Module> {
+    pub fn get_module(&self, k: &Cid) -> Option<(Module, EdgeModule)> {
         let k = self.with_redirect(k);
-        self.0
+        let module = self
+            .0
             .module_cache
             .lock()
             .expect("module_cache poisoned")
             .get(k)
-            .cloned()
+            .cloned()?;
+        let edge_module = self
+            .0
+            .edge_module_cache
+            .lock()
+            .expect("module_cache poisoned")
+            .get(k)
+            .cloned()?;
+        Some((module, edge_module))
     }
 
     /// Lookup and instantiate a loaded wasmtime module with the given store. This will cache the
@@ -333,8 +371,15 @@ impl Engine {
     pub fn get_instance<K: Kernel>(
         &self,
         store: &mut wasmtime::Store<InvocationData<K>>,
+        edge_store: &mut Store,
         k: &Cid,
-    ) -> anyhow::Result<Option<wasmtime::Instance>> {
+    ) -> anyhow::Result<
+        Option<(
+            wasmtime::Instance,
+            wasmedge_sys::Instance,
+            wasmedge_sys::Executor,
+        )>,
+    > {
         let k = self.with_redirect(k);
         let mut instance_cache = self.0.instance_cache.lock().expect("cache poisoned");
 
@@ -359,7 +404,32 @@ impl Engine {
         };
         let instance = cache.linker.instantiate(&mut *store, module)?;
 
-        Ok(Some(instance))
+        let edge_module_cache = self
+            .0
+            .edge_module_cache
+            .lock()
+            .expect("edge_module_cache poisoned");
+        let edge_module = match edge_module_cache.get(k) {
+            Some(module) => module,
+            None => return Ok(None),
+        };
+        // create an Executor context
+        let mut executor = Executor::create(None, None)?;
+        // // create a Store context
+        // let mut store = Store::create()?;
+        // add global
+        let mut import = ImportModule::create("gas")?;
+        let ty = wasmedge_sys::GlobalType::create(
+            wasmedge_types::ValType::I64,
+            wasmedge_types::Mutability::Var,
+        )?;
+        let global = wasmedge_sys::Global::create(&ty, WasmValue::from_i64(0))?;
+        import.add_global(GAS_COUNTER_NAME, global);
+        let import = ImportObject::Import(import);
+        // register a wasm module as an active module
+        executor.register_import_object(edge_store, &import)?;
+        let active_instance = executor.register_active_module(edge_store, &edge_module)?;
+        Ok(Some((instance, active_instance, executor)))
     }
 
     /// Construct a new wasmtime "store" from the given kernel.

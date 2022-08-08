@@ -17,7 +17,7 @@ use wasmedge_types::{
 /// representation of an input WebAssembly binary. In the instantiation process, a [Module] is used to create a
 /// [module stance](crate::instance), from which the exported [functions](crate::Function), [tables](crate::Table),
 /// [memories](crate::Memory), and [globals](crate::Global) can be fetched.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Module {
     pub(crate) inner: InnerModule,
 }
@@ -76,7 +76,7 @@ impl Module {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct InnerModule(pub(crate) *mut ffi::WasmEdge_ASTModuleContext);
 unsafe impl Send for InnerModule {}
 unsafe impl Sync for InnerModule {}
