@@ -12,7 +12,7 @@ use wasmedge_types::ValType;
 // Wrapper function for thread-safe scenarios.
 extern "C" fn wraper_fn(
     key_ptr: *mut c_void,
-    _data: *mut c_void,
+    data: *mut c_void,
     _mem_cxt: *mut ffi::WasmEdge_MemoryInstanceContext,
     params: *const ffi::WasmEdge_Value,
     param_len: u32,
@@ -43,7 +43,7 @@ extern "C" fn wraper_fn(
         let real_fn = host_functions
             .get(&key)
             .expect("host function should be there");
-        real_fn(input)
+        real_fn(input, data)
     };
 
     match result {
@@ -183,7 +183,7 @@ impl Function {
     /// // create a Function instance
     /// let func = Function::create(&func_ty, Box::new(real_add), 0).expect("fail to create a Function instance");
     /// ```
-    pub fn create(ty: &FuncType, real_fn: BoxedFn, cost: u64) -> WasmEdgeResult<Self> {
+    pub fn create<T>(ty: &FuncType, real_fn: BoxedFn, data: Option<*mut T>, cost: u64) -> WasmEdgeResult<Self> {
         let mut host_functions = HOST_FUNCS.lock().expect("[wasmedge-sys] try lock failed.");
         if host_functions.len() >= host_functions.capacity() {
             return Err(WasmEdgeError::Func(FuncError::CreateBinding(format!(
@@ -199,13 +199,16 @@ impl Function {
             key = rng.gen();
         }
         host_functions.insert(key, real_fn);
-
+        let data =  match data {
+            None => std::ptr::null_mut(),
+            Some(data) => data as *mut _ as  *mut c_void
+        };
         let ctx = unsafe {
             ffi::WasmEdge_FunctionInstanceCreateBinding(
                 ty.inner.0,
                 Some(wraper_fn),
                 key as *const usize as *mut c_void,
-                std::ptr::null_mut(),
+                data,
                 cost,
             )
         };

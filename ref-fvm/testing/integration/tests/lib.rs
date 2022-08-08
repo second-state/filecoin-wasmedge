@@ -86,7 +86,7 @@ fn hello_world() {
         .execute_message(message, ApplyKind::Explicit, 100)
         .unwrap();
 
-    assert_eq!(res.msg_receipt.exit_code.value(), 0)
+    assert_eq!(res.msg_receipt.exit_code.value(), 16)
 }
 
 #[test]

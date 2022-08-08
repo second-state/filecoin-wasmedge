@@ -9,15 +9,15 @@ use fvm_ipld_blockstore::Blockstore;
 use fvm_wasm_instrument::gas_metering::GAS_COUNTER_NAME;
 use fvm_wasm_instrument::parity_wasm::elements;
 use wasmedge_sys::{
-    Config, Executor, ImportInstance, ImportModule, ImportObject, Loader, Module as EdgeModule,
-    Store, Validator, WasmValue,
+    Config, ImportInstance, ImportModule, ImportObject, Loader,
+    Module as EdgeModule, Store, Validator, Vm, WasmValue,
 };
 use wasmtime::OptLevel::Speed;
 use wasmtime::{Global, GlobalType, Linker, Memory, MemoryType, Module, Mutability, Val, ValType};
 
 use crate::gas::WasmGasPrices;
 use crate::machine::NetworkConfig;
-use crate::syscalls::{bind_syscalls, InvocationData};
+use crate::syscalls::{bind_syscalls, bind_wasmedge_syscalls, InvocationData};
 use crate::Kernel;
 
 /// A caching wasmtime engine.
@@ -152,6 +152,7 @@ pub fn default_wasmtime_config() -> wasmtime::Config {
 
 struct EngineInner {
     engine: wasmtime::Engine,
+    edge: Mutex<wasmedge_sys::Vm>,
 
     /// These two fields are used used in the store constructor to avoid resolve a chicken & egg
     /// situation: We need the store before we can get the real values, but we need to create the
@@ -185,6 +186,7 @@ impl Engine {
     /// Create a new Engine from a wasmtime config.
     pub fn new(c: &wasmtime::Config, ec: EngineConfig) -> anyhow::Result<Self> {
         let engine = wasmtime::Engine::new(c)?;
+        let edge = Mutex::new(Vm::create(None, None).unwrap());
         let mut dummy_store = wasmtime::Store::new(&engine, ());
         let gg_type = GlobalType::new(ValType::I64, Mutability::Var);
         let dummy_gg = Global::new(&mut dummy_store, gg_type, Val::I64(0))
@@ -197,6 +199,7 @@ impl Engine {
 
         Ok(Engine(Arc::new(EngineInner {
             engine,
+            edge,
             dummy_memory,
             dummy_gas_global: dummy_gg,
             module_cache: Default::default(),
@@ -373,13 +376,7 @@ impl Engine {
         store: &mut wasmtime::Store<InvocationData<K>>,
         edge_store: &mut Store,
         k: &Cid,
-    ) -> anyhow::Result<
-        Option<(
-            wasmtime::Instance,
-            wasmedge_sys::Instance,
-            wasmedge_sys::Executor,
-        )>,
-    > {
+    ) -> anyhow::Result<Option<wasmtime::Instance>> {
         let k = self.with_redirect(k);
         let mut instance_cache = self.0.instance_cache.lock().expect("cache poisoned");
 
@@ -413,10 +410,11 @@ impl Engine {
             Some(module) => module,
             None => return Ok(None),
         };
-        // create an Executor context
-        let mut executor = Executor::create(None, None)?;
-        // // create a Store context
-        // let mut store = Store::create()?;
+
+        let mut edge = self.0.edge.lock().expect("cache poisoned");
+        edge.load_wasm_from_module(&edge_module)?;
+        edge.validate()?;
+
         // add global
         let mut import = ImportModule::create("gas")?;
         let ty = wasmedge_sys::GlobalType::create(
@@ -425,11 +423,13 @@ impl Engine {
         )?;
         let global = wasmedge_sys::Global::create(&ty, WasmValue::from_i64(0))?;
         import.add_global(GAS_COUNTER_NAME, global);
-        let import = ImportObject::Import(import);
-        // register a wasm module as an active module
-        executor.register_import_object(edge_store, &import)?;
-        let active_instance = executor.register_active_module(edge_store, &edge_module)?;
-        Ok(Some((instance, active_instance, executor)))
+        edge.register_wasm_from_import(ImportObject::Import(import))?;
+
+        bind_wasmedge_syscalls(&mut edge, store.data_mut())?;
+
+        edge.instantiate()?;
+
+        Ok(Some(instance))
     }
 
     /// Construct a new wasmtime "store" from the given kernel.
@@ -449,6 +449,14 @@ impl Engine {
         store.data_mut().avail_gas_global = gg;
 
         store
+    }
+
+    pub fn execute(&self) {
+        let  edge = self.0.edge.lock().expect("cache poisoned");
+        let result = edge
+            .run_function("invoke", [WasmValue::from_i32(4)])
+            .unwrap();
+        println!("result = {:?}", result);
     }
 }
 

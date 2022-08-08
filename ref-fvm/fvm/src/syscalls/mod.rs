@@ -1,6 +1,8 @@
 use std::mem;
+use std::sync::MutexGuard;
 
 use anyhow::{anyhow, Context as _};
+use wasmedge_sys::Vm;
 use wasmtime::{AsContextMut, Global, Linker, Memory, Val};
 
 use crate::call_manager::backtrace;
@@ -175,5 +177,17 @@ pub fn bind_syscalls(
     linker.bind("debug", "enabled", debug::enabled)?;
     linker.bind("debug", "store_artifact", debug::store_artifact)?;
 
+    Ok(())
+}
+
+use crate::syscalls::bind::BindWasmedgeSyscall;
+
+// Binds the syscall handlers so they can handle invocations
+// from the actor code.
+pub fn bind_wasmedge_syscalls(
+    vm: &mut MutexGuard<Vm>,
+    id: &mut InvocationData<impl Kernel + 'static>,
+) -> anyhow::Result<()> {
+    vm.bind("vm", "abort", vm::abort_wrap, id)?;
     Ok(())
 }

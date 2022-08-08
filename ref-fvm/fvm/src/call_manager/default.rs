@@ -8,7 +8,7 @@ use fvm_shared::error::{ErrorNumber, ExitCode};
 use fvm_shared::sys::BlockId;
 use fvm_shared::{ActorID, MethodNum, METHOD_SEND};
 use num_traits::Zero;
-use wasmedge_sys::{Engine, Store, WasmValue};
+use wasmedge_sys::{Store};
 
 use super::{Backtrace, CallManager, InvocationResult, NO_DATA_BLOCK_ID};
 use crate::call_manager::backtrace::Frame;
@@ -364,7 +364,7 @@ where
             // From this point on, there are no more syscall errors, only aborts.
             let result: std::result::Result<BlockId, Abort> = (|| {
                 // Instantiate the module.
-                let (instance, edge_instance, mut edge_executor) = engine
+                let instance = engine
                     .get_instance(&mut store, &mut edge_store, &state.code)
                     .and_then(|i| i.context("actor code not found"))
                     .map_err(Abort::Fatal)?;
@@ -392,9 +392,9 @@ where
                 .map_err(|panic| Abort::Fatal(anyhow!("panic within actor: {:?}", panic)))?;
                 println!("wasmtime results : {:?}", res);
 
-                let edge_invoke = edge_instance.get_func("invoke").unwrap();
-                let result = edge_executor.run_func(&edge_invoke, [WasmValue::from_i32(4)]);
-                println!("wasmedge result : {:?}", result);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.execute()))
+                    .map_err(|panic| Abort::Fatal(anyhow!("panic within actor: {:?}", panic)))?;
+
                 // Charge for any remaining uncharged execution gas, returning an error if we run
                 // out.
                 charge_for_exec(&mut store)?;

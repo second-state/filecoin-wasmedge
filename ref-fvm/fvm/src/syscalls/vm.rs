@@ -14,6 +14,10 @@ pub enum Never {}
 
 unsafe impl SyscallSafe for Never {}
 
+pub fn abort_wrap(context: Context<'_, impl Kernel>, args: &[u32]) -> Result<Never, Abort> {
+    return abort(context, args[0], args[1], args[2]);
+}
+
 // NOTE: this won't clobber the last syscall error because it directly returns a "trap".
 pub fn abort(
     context: Context<'_, impl Kernel>,

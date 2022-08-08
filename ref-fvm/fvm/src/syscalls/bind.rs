@@ -1,7 +1,9 @@
+use std::ffi::c_void;
 use std::mem;
 
 use fvm_shared::error::ErrorNumber;
 use fvm_shared::sys::SyscallSafe;
+use wasmedge_sys::{FuncType, Function, ImportInstance, ImportModule, ImportObject, Vm, WasmValue};
 use wasmtime::{Caller, Linker, WasmTy};
 
 use super::context::Memory;
@@ -188,6 +190,87 @@ macro_rules! impl_bind_syscalls {
                 }
             }
         }
+    }
+}
+
+/// Binds syscalls to a linker, converting the returned error according to the syscall convention:
+///
+/// 1. If the error is a syscall error, it's returned as the first return value.
+/// 2. If the error is a fatal error, a Trap is returned.
+pub(super) trait BindWasmedgeSyscall<Ret, K, Func> {
+    /// Bind a syscall to the linker.
+    ///
+    /// 1. The return type will be automatically adjusted to return `Result<u32, Trap>` where
+    /// `u32` is the error code.
+    /// 2. If the return type is non-empty (i.e., not `()`), an out-pointer will be prepended to the
+    /// arguments for the return-value.
+    ///
+    /// By example:
+    ///
+    /// - `fn(u32) -> kernel::Result<()>` will become `fn(u32) -> Result<u32, Trap>`.
+    /// - `fn(u32) -> kernel::Result<i64>` will become `fn(u32, u32) -> Result<u32, Trap>`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// mod my_module {
+    ///     pub fn zero(mut context: Context<'_, impl Kernel>, arg: i32) -> crate::fvm::kernel::Result<i32> {
+    ///         Ok(0)
+    ///     }
+    /// }
+    /// let engine = wasmtime::Engine::default();
+    /// let mut linker = wasmtime::Linker::new(&engine);
+    /// linker.bind("my_module", "zero", my_module::zero);
+    /// ```
+    fn bind(
+        &mut self,
+        module: &'static str,
+        name: &'static str,
+        syscall: Func,
+        id: &mut InvocationData<K>,
+    ) -> anyhow::Result<()>;
+}
+
+impl<Ret, K, Func> BindWasmedgeSyscall<Ret, K, Func> for Vm
+where
+    K: Kernel,
+    Func: Fn(Context<'_, K>, &[u32]) -> Ret + Send + Sync + 'static,
+    Ret: IntoSyscallResult,
+    // $($t: WasmTy+SyscallSafe,)*
+{
+    fn bind(
+        &mut self,
+        module: &'static str,
+        name: &'static str,
+        syscall: Func,
+        id: &mut InvocationData<K>,
+    ) -> anyhow::Result<()> {
+        if mem::size_of::<Ret::Value>() == 0 {
+            let host_func =
+                move |args: Vec<WasmValue>, data: *mut c_void| -> Result<Vec<WasmValue>, u8> {
+                    unsafe {
+                        let d = data as *mut InvocationData<K>;
+                        // charge_syscall_gas!((*d).kernel);
+                        let ctx = Context {
+                            kernel: &mut (*d).kernel,
+                            memory: &mut Memory::new(&mut [0u8; 0]),
+                        };
+                        let temp = vec![1, 2, 3];
+                        let out = syscall(ctx, &temp[..]).into();
+                    }
+                    Ok(vec![WasmValue::from_i32(1)])
+                };
+            let func_ty = FuncType::create(
+                vec![wasmedge_types::ValType::I32; 3],
+                vec![wasmedge_types::ValType::I32],
+            )?;
+            let func = Function::create(&func_ty, Box::new(host_func), Some(id), 0)?;
+            let mut import = ImportModule::create(module)?;
+            import.add_func(name, func);
+            self.register_wasm_from_import(ImportObject::Import(import))?;
+        } else {
+        }
+        Ok(())
     }
 }
 

@@ -217,9 +217,10 @@ pub use validator::Validator;
 pub use vm::Vm;
 
 use wasmedge_types::{error, WasmEdgeResult};
+use core::ffi::c_void;
 
 /// Type alias for a boxed native function. This type is used in thread-safe cases.
-pub type BoxedFn = Box<dyn Fn(Vec<WasmValue>) -> Result<Vec<WasmValue>, u8> + Send + Sync>;
+pub type BoxedFn = Box<dyn Fn(Vec<WasmValue>, *mut c_void) -> Result<Vec<WasmValue>, u8> + Send + Sync>;
 
 lazy_static! {
     static ref HOST_FUNCS: Arc<Mutex<HashMap<usize, BoxedFn>>> =
