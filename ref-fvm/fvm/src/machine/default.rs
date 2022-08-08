@@ -16,6 +16,8 @@ use num_traits::Signed;
 use super::{Engine, Machine, MachineContext};
 use crate::blockstore::BufferedBlockstore;
 use crate::externs::Externs;
+#[cfg(feature = "m2-native")]
+use crate::init_actor::State as InitActorState;
 use crate::kernel::{ClassifyResult, Context as _, Result};
 use crate::state_tree::{ActorState, StateTree};
 use crate::syscall_error;
@@ -120,11 +122,23 @@ where
         #[cfg(not(any(test, feature = "testing")))]
         engine.preload(state_tree.store(), builtin_actors.left_values())?;
 
-        let randomness = externs.get_chain_randomness(
-            0,
-            context.epoch,
-            context.initial_state_root.to_bytes().as_slice(),
-        )?;
+        #[cfg(feature = "m2-native")]
+        {
+            // preload user actors that have been installed
+            // TODO This must be revisited when implementing the actively managed cache.
+            // Doesn't need the m2-native feature guard because there's no possiblity
+            // for user code to install new actors if that feature is disabled anyway
+            // (so this would be a no-op). We could add the guard as an optimization, though.
+            let (init_state, _) = InitActorState::load(&state_tree)?;
+            let installed_actors: Vec<Cid> = state_tree
+                .store()
+                .get_cbor(&init_state.installed_actors)?
+                .context("failed to load installed actor list")?;
+            engine.preload(state_tree.store(), &installed_actors)?;
+        }
+
+        // 16 bytes is random _enough_
+        let randomness: [u8; 16] = rand::random();
 
         Ok(DefaultMachine {
             context: context.clone(),
@@ -135,7 +149,7 @@ where
             id: format!(
                 "{}-{}",
                 context.epoch,
-                cid::multibase::encode(cid::multibase::Base::Base32Lower, &randomness[..16])
+                cid::multibase::encode(cid::multibase::Base::Base32Lower, &randomness)
             ),
         })
     }
